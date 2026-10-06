@@ -1,0 +1,22 @@
+{
+  "name": "synccode-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SyncCode: Real-Time Collaborative Code Workspace",
+  "workspaces": [
+    "shared",
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -n \"SERVER,CLIENT\" -c \"blue,green\" \"npm run dev -w server\" \"npm run dev -w client\"",
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
+    "test": "npm run test -w server",
+    "lint": "npm run lint -w server && npm run lint -w client"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}
