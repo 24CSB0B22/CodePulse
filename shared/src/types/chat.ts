@@ -1,3 +1,5 @@
+export const MAX_CHAT_MESSAGE_LENGTH = 1000;
+
 export interface ChatMessage {
   messageId: string;
   roomId: string;
@@ -10,6 +12,25 @@ export interface ChatMessage {
 }
 
 export interface SendChatMessageRequest {
-  roomId: string;
+  roomId?: string;
   content: string;
+}
+
+export type ChatErrorCode =
+  | 'INVALID_MESSAGE'
+  | 'MESSAGE_TOO_LONG'
+  | 'RATE_LIMITED'
+  | 'UNAUTHORIZED'
+  | 'ROOM_NOT_FOUND'
+  | 'INTERNAL_ERROR';
+
+export interface ChatErrorPayload {
+  code: ChatErrorCode;
+  message: string;
+}
+
+export interface SendChatMessageResponse {
+  success: boolean;
+  message?: ChatMessage;
+  error?: ChatErrorPayload;
 }

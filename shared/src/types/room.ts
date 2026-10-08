@@ -1,5 +1,5 @@
 import { ParticipantColor } from '../constants/colors';
-import { MonacoRange } from './operations';
+import { MonacoRange, EditorSyncPayload } from './operations';
 
 export type { MonacoRange };
 
@@ -53,11 +53,25 @@ export interface JoinRoomRequest {
   displayName: string;
   password?: string;
   userId?: string;
+  reconnectToken?: string;
 }
 
 export interface LeaveRoomRequest {
   roomId: string;
   userId?: string;
+}
+
+export interface RoomLockRequest {
+  roomId?: string;
+}
+
+export interface ParticipantRemoveRequest {
+  roomId?: string;
+  targetUserId: string;
+}
+
+export interface RoomCloseRequest {
+  roomId?: string;
 }
 
 export type RoomErrorCode =
@@ -67,6 +81,8 @@ export type RoomErrorCode =
   | 'UNAUTHORIZED'
   | 'INVALID_REQUEST'
   | 'ALREADY_IN_ROOM'
+  | 'IDENTITY_IN_USE'
+  | 'INVALID_RECONNECT_TOKEN'
   | 'INTERNAL_ERROR';
 
 export interface RoomErrorPayload {
@@ -89,5 +105,25 @@ export interface ParticipantLeftPayload {
 export interface PresenceUpdatePayload {
   roomId: string;
   userId: string;
-  connectionState: ConnectionState;
+  connectionState?: ConnectionState;
+  isTyping?: boolean;
+  isMuted?: boolean;
+  isSpeaking?: boolean;
+  cursor?: CursorPosition;
+  selection?: MonacoRange;
+}
+
+export interface ReconnectRequest {
+  roomId: string;
+  userId: string;
+  lastKnownRevision: number;
+  reconnectToken?: string;
+}
+
+export interface ReconnectResponse {
+  success: boolean;
+  syncPayload?: EditorSyncPayload;
+  room?: RoomState;
+  participant?: Participant;
+  error?: RoomErrorPayload;
 }

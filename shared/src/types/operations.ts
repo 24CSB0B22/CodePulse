@@ -18,6 +18,7 @@ export interface EditOperation {
   insertedText: string;
   deletedText: string;
   deleteCount?: number;
+  rangeLength?: number;
   timestamp: number;
   clientSequence: number;
   roomId?: string;

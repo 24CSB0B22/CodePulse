@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { SyncEngine } from '../src/modules/collaboration/syncEngine';
 import { roomManager } from '../src/modules/rooms/roomManager';
-import { EditOperation } from '@synccode/shared';
+import { EditOperation, createEditOperation } from '@synccode/shared';
 
 describe('SyncEngine Unit & Concurrency Tests', () => {
   let engine: SyncEngine;
@@ -47,6 +47,79 @@ describe('SyncEngine Unit & Concurrency Tests', () => {
     const room = roomManager.getRoomEntity(roomId);
     expect(room?.document.currentRevision).toBe(1);
     expect(room?.document.content.startsWith('// Comment\nconst a = 1;')).toBe(true);
+  });
+
+  it.each([
+    {
+      name: 'insertion',
+      range: { startLineNumber: 1, startColumn: 2, endLineNumber: 1, endColumn: 2 },
+      rangeOffset: 1,
+      rangeLength: 0,
+      insertedText: 'X',
+      deletedText: '',
+      result: 'aXbc',
+    },
+    {
+      name: 'deletion',
+      range: { startLineNumber: 1, startColumn: 2, endLineNumber: 1, endColumn: 4 },
+      rangeOffset: 1,
+      rangeLength: 2,
+      insertedText: '',
+      deletedText: 'bc',
+      result: 'a',
+    },
+    {
+      name: 'replacement',
+      range: { startLineNumber: 1, startColumn: 2, endLineNumber: 1, endColumn: 4 },
+      rangeOffset: 1,
+      rangeLength: 2,
+      insertedText: 'X',
+      deletedText: 'bc',
+      result: 'aX',
+    },
+  ])('captures and broadcasts correct $name delta data', async (testCase) => {
+    const { room: testRoom, participant } = roomManager.createRoom(
+      { displayName: 'DeltaTester', initialContent: 'abc' },
+      `socket-${testCase.name}`
+    );
+    const operation = createEditOperation({
+      operationId: `delta-${testCase.name}`,
+      userId: participant.userId,
+      roomId: testRoom.roomId,
+      baseRevision: 0,
+      range: testCase.range,
+      rangeOffset: testCase.rangeOffset,
+      rangeLength: testCase.rangeLength,
+      insertedText: testCase.insertedText,
+      baseContent: 'abc',
+      timestamp: 123,
+      clientSequence: 7,
+    });
+
+    const result = await engine.processOperation(
+      testRoom.roomId,
+      operation,
+      `socket-${testCase.name}`
+    );
+
+    expect(operation).toMatchObject({
+      operationId: `delta-${testCase.name}`,
+      baseRevision: 0,
+      range: testCase.range,
+      deletedText: testCase.deletedText,
+      deleteCount: testCase.rangeLength,
+      insertedText: testCase.insertedText,
+      clientSequence: 7,
+    });
+    expect(result.success).toBe(true);
+    expect(result.broadcastOp).toMatchObject({
+      operationId: operation.operationId,
+      range: testCase.range,
+      deletedText: testCase.deletedText,
+      insertedText: testCase.insertedText,
+      revision: 1,
+    });
+    expect(roomManager.getRoomEntity(testRoom.roomId)?.document.content).toBe(testCase.result);
   });
 
   it('should reject operation with invalid payload structure', async () => {

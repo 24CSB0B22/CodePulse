@@ -7,6 +7,12 @@ import {
 } from '@synccode/shared';
 import { syncEngine } from '../modules/collaboration/syncEngine';
 import { roomManager } from '../modules/rooms/roomManager';
+import {
+  validatePayload,
+  editorOperationSchema,
+  editorSyncSchema,
+} from '../validation/socketSchemas';
+import { checkEditorRateLimit } from './editorRateLimiter';
 
 export function registerEditorHandlers(io: Server, socket: Socket): void {
   /**
@@ -15,7 +21,7 @@ export function registerEditorHandlers(io: Server, socket: Socket): void {
   socket.on(
     SOCKET_EVENTS.EDITOR_OPERATION,
     async (
-      operation: EditOperation,
+      rawOperation: unknown,
       callback?: (response: {
         success: boolean;
         ack?: OperationAck;
@@ -23,6 +29,24 @@ export function registerEditorHandlers(io: Server, socket: Socket): void {
         error?: string;
       }) => void
     ) => {
+      // 1. Rate Limiting Check
+      if (!checkEditorRateLimit(socket.id)) {
+        if (typeof callback === 'function') {
+          callback({ success: false, error: 'RATE_LIMITED' });
+        }
+        return;
+      }
+
+      // 2. Runtime Schema Validation
+      const validation = validatePayload(editorOperationSchema, rawOperation);
+      if (!validation.success) {
+        if (typeof callback === 'function') {
+          callback({ success: false, error: `INVALID_PAYLOAD: ${validation.error}` });
+        }
+        return;
+      }
+
+      const operation = validation.data as EditOperation;
       const context = roomManager.getSocketContext(socket.id);
       const roomId = operation.roomId || context?.roomId;
 
@@ -40,6 +64,15 @@ export function registerEditorHandlers(io: Server, socket: Socket): void {
       }
 
       const result = await syncEngine.processOperation(roomId, operation, socket.id);
+
+      if (result.isDuplicate && result.ack) {
+        // Idempotent duplicate: acknowledge sender without duplicate broadcast
+        socket.emit(SOCKET_EVENTS.EDITOR_ACK, result.ack);
+        if (typeof callback === 'function') {
+          callback({ success: true, ack: result.ack });
+        }
+        return;
+      }
 
       if (result.success && result.broadcastOp && result.ack) {
         // 1. Broadcast the accepted operation to all other collaborators in the room
@@ -72,20 +105,34 @@ export function registerEditorHandlers(io: Server, socket: Socket): void {
   socket.on(
     SOCKET_EVENTS.EDITOR_SYNC,
     (
-      payload: EditorSyncRequest,
+      rawPayload: unknown,
       callback?: (response: { success: boolean; data?: any; error?: string }) => void
     ) => {
-      const context = roomManager.getSocketContext(socket.id);
-      const roomId = payload.roomId || context?.roomId;
+      const validation = validatePayload(editorSyncSchema, rawPayload || {});
+      if (!validation.success) {
+        if (typeof callback === 'function') {
+          callback({ success: false, error: `INVALID_PAYLOAD: ${validation.error}` });
+        }
+        return;
+      }
+      const payload = validation.data;
 
-      if (!roomId) {
+      const context = roomManager.getSocketContext(socket.id);
+      if (!context) {
         if (typeof callback === 'function') {
           callback({ success: false, error: 'NOT_IN_A_ROOM' });
         }
         return;
       }
 
-      const syncPayload = syncEngine.getSyncPayload(roomId, payload.lastKnownRevision ?? 0);
+      if (payload.roomId && payload.roomId !== context.roomId) {
+        if (typeof callback === 'function') {
+          callback({ success: false, error: 'UNAUTHORIZED' });
+        }
+        return;
+      }
+
+      const syncPayload = syncEngine.getSyncPayload(context.roomId, payload.lastKnownRevision ?? 0);
       if (syncPayload) {
         socket.emit(SOCKET_EVENTS.EDITOR_SYNC, syncPayload);
 

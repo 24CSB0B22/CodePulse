@@ -5,4 +5,5 @@ export * from './types/room';
 export * from './types/presence';
 export * from './types/chat';
 export * from './types/execution';
+export * from './types/voice';
 export * from './utils/textUtils';

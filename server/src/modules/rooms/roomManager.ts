@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import bcrypt from 'bcrypt';
 import {
   RoomState,
   Participant,
@@ -6,9 +7,18 @@ import {
   PARTICIPANT_PALETTE,
   CreateRoomRequest,
   JoinRoomRequest,
+  ReconnectRequest,
   RoomErrorCode,
   RoomDocument,
+  CursorPosition,
+  MonacoRange,
+  PresenceUpdatePayload,
 } from '@synccode/shared';
+
+export interface RoomParticipantEntity extends Participant {
+  socketId: string;
+  reconnectToken: string;
+}
 
 export interface RoomEntity {
   roomId: string;
@@ -16,8 +26,9 @@ export interface RoomEntity {
   isLocked: boolean;
   passwordHash?: string;
   document: RoomDocument;
-  participants: Map<string, Participant & { socketId: string }>;
+  participants: Map<string, RoomParticipantEntity>;
   createdAt: number;
+  hostDisconnectedAt?: number;
 }
 
 export class RoomError extends Error {
@@ -33,6 +44,9 @@ export class RoomError extends Error {
 export class RoomManager {
   private rooms: Map<string, RoomEntity> = new Map();
   private socketToRoom: Map<string, { roomId: string; userId: string }> = new Map();
+  private hostPromotionTimers = new Map<string, NodeJS.Timeout>();
+
+  constructor(private readonly hostDisconnectGraceMs = 30_000) {}
 
   /**
    * Generates a cryptographically secure, collision-resistant Room ID.
@@ -48,22 +62,17 @@ export class RoomManager {
   }
 
   /**
-   * Hashes a room password using PBKDF2 with a random salt.
+   * Hashes a room password using bcrypt with standard cost factor (10 rounds).
    */
   private hashPassword(password: string): string {
-    const salt = crypto.randomBytes(16).toString('hex');
-    const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-    return `${salt}:${hash}`;
+    return bcrypt.hashSync(password, 10);
   }
 
   /**
-   * Validates a candidate password against the stored salt:hash string.
+   * Validates a candidate password against the stored bcrypt hash.
    */
   private verifyPassword(password: string, storedHash: string): boolean {
-    const [salt, key] = storedHash.split(':');
-    if (!salt || !key) return false;
-    const testHash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
-    return crypto.timingSafeEqual(Buffer.from(testHash, 'hex'), Buffer.from(key, 'hex'));
+    return bcrypt.compareSync(password, storedHash);
   }
 
   /**
@@ -91,24 +100,26 @@ export class RoomManager {
     request: CreateRoomRequest,
     socketId: string,
     hostUserId?: string
-  ): { room: RoomState; participant: Participant } {
+  ): { room: RoomState; participant: Participant; reconnectToken: string } {
     if (!request.displayName || request.displayName.trim().length === 0) {
       throw new RoomError('INVALID_REQUEST', 'Display name is required');
     }
 
     const roomId = this.generateRoomId();
     const userId = hostUserId || `user-${crypto.randomBytes(6).toString('hex')}`;
+    const reconnectToken = crypto.randomBytes(32).toString('hex');
     const displayName = request.displayName.trim().slice(0, 32);
 
     const hostColor = PARTICIPANT_PALETTE[0];
-    const hostParticipant: Participant & { socketId: string } = {
+    const hostParticipant: RoomParticipantEntity = {
       userId,
       socketId,
+      reconnectToken,
       displayName,
       role: 'HOST',
       color: hostColor,
       connectionState: 'CONNECTED',
-      isMuted: false,
+      isMuted: true,
       isSpeaking: false,
       isTyping: false,
     };
@@ -116,7 +127,13 @@ export class RoomManager {
     const initialLang = request.language || 'javascript';
     const defaultTemplate =
       request.initialContent ||
-      `// Welcome to SyncCode! (Room: ${roomId})\n// Connected as Host: ${displayName}\n\nfunction main() {\n  console.log("Hello, SyncCode!");\n}\n\nmain();\n`;
+      (initialLang === 'java'
+        ? `public class Main {\n    public static void main(String[] args) {\n        System.out.println("Hello, SyncCode!");\n    }\n}\n`
+        : initialLang === 'python'
+          ? `# Welcome to SyncCode! (Room: ${roomId})\n# Connected as Host: ${displayName}\n\nprint("Hello, SyncCode!")\n`
+          : initialLang === 'cpp'
+            ? `// Welcome to SyncCode! (Room: ${roomId})\n// Connected as Host: ${displayName}\n\n#include <iostream>\n\nint main() {\n    std::cout << "Hello, SyncCode!" << std::endl;\n    return 0;\n}\n`
+            : `// Welcome to SyncCode! (Room: ${roomId})\n// Connected as Host: ${displayName}\n\nfunction main() {\n  console.log("Hello, SyncCode!");\n}\n\nmain();\n`);
 
     const roomEntity: RoomEntity = {
       roomId,
@@ -124,7 +141,14 @@ export class RoomManager {
       isLocked: false,
       passwordHash: request.password ? this.hashPassword(request.password) : undefined,
       document: {
-        filename: initialLang === 'python' ? 'main.py' : initialLang === 'cpp' ? 'main.cpp' : 'main.js',
+        filename:
+          initialLang === 'java'
+            ? 'Main.java'
+            : initialLang === 'python'
+              ? 'main.py'
+              : initialLang === 'cpp'
+                ? 'main.cpp'
+                : 'main.js',
         language: initialLang,
         content: defaultTemplate,
         currentRevision: 0,
@@ -139,6 +163,7 @@ export class RoomManager {
     return {
       room: this.serializeRoom(roomEntity),
       participant: this.serializeParticipant(hostParticipant),
+      reconnectToken,
     };
   }
 
@@ -148,7 +173,7 @@ export class RoomManager {
   public joinRoom(
     request: JoinRoomRequest,
     socketId: string
-  ): { room: RoomState; participant: Participant; isReconnection: boolean } {
+  ): { room: RoomState; participant: Participant; reconnectToken: string; isReconnection: boolean } {
     const roomId = request.roomId?.trim();
     if (!roomId) {
       throw new RoomError('INVALID_REQUEST', 'Room ID is required');
@@ -166,38 +191,54 @@ export class RoomManager {
       }
     }
 
-    const displayName = (request.displayName || 'Collaborator').trim().slice(0, 32);
-    let userId = request.userId;
-    let existingParticipant: (Participant & { socketId: string }) | undefined;
-
-    // Check if user is reconnecting by userId or matching displayName
-    if (userId && room.participants.has(userId)) {
-      existingParticipant = room.participants.get(userId);
-    } else {
-      for (const p of room.participants.values()) {
-        if (p.displayName.toLowerCase() === displayName.toLowerCase() && p.connectionState === 'DISCONNECTED') {
-          existingParticipant = p;
-          userId = p.userId;
-          break;
-        }
-      }
+    const displayName = (request.displayName || '').trim().slice(0, 32);
+    if (!displayName) {
+      throw new RoomError('INVALID_REQUEST', 'Display name is required');
     }
 
-    // If reconnecting
-    if (existingParticipant && userId) {
-      existingParticipant.socketId = socketId;
-      existingParticipant.connectionState = 'CONNECTED';
-      existingParticipant.displayName = displayName;
-      this.socketToRoom.set(socketId, { roomId, userId });
+    // 1. Genuine Reconnection Check (Requires valid, matching reconnect token)
+    if (request.userId && room.participants.has(request.userId)) {
+      const existing = room.participants.get(request.userId)!;
+
+      // Verify token authenticity
+      if (!request.reconnectToken || request.reconnectToken !== existing.reconnectToken) {
+        throw new RoomError('UNAUTHORIZED', 'Invalid or missing reconnect token for participant identity');
+      }
+
+      // Prevent claiming an identity that is currently connected
+      if (existing.connectionState === 'CONNECTED') {
+        throw new RoomError('IDENTITY_IN_USE', 'Participant identity is already actively in use');
+      }
+
+      // Restore session
+      existing.socketId = socketId;
+      existing.connectionState = 'CONNECTED';
+      if (room.hostId === existing.userId) {
+        const timer = this.hostPromotionTimers.get(roomId);
+        if (timer) clearTimeout(timer);
+        this.hostPromotionTimers.delete(roomId);
+        room.hostDisconnectedAt = undefined;
+      }
+      if (displayName) {
+        existing.displayName = displayName;
+      }
+      this.socketToRoom.set(socketId, { roomId, userId: existing.userId });
+      this.promoteAfterHostGraceIfNeeded(room, existing);
 
       return {
         room: this.serializeRoom(room),
-        participant: this.serializeParticipant(existingParticipant),
+        participant: this.serializeParticipant(existing),
+        reconnectToken: existing.reconnectToken,
         isReconnection: true,
       };
     }
 
-    // Capacity verification: max 5 active participants
+    // If client supplied an invalid reconnectToken for an unknown or mismatched userId
+    if (request.reconnectToken && (!request.userId || !room.participants.has(request.userId))) {
+      throw new RoomError('INVALID_RECONNECT_TOKEN', 'Reconnect token does not match any room participant');
+    }
+
+    // 2. Capacity verification for new admissions: max 5 active participants
     const activeParticipantsCount = Array.from(room.participants.values()).filter(
       (p) => p.connectionState === 'CONNECTED'
     ).length;
@@ -206,29 +247,100 @@ export class RoomManager {
       throw new RoomError('ROOM_FULL', 'Room has reached maximum capacity of 5 participants');
     }
 
-    // Create new participant
-    userId = userId || `user-${crypto.randomBytes(6).toString('hex')}`;
+    // 3. New participant registration with server-generated identity
+    const newUserId = `user-${crypto.randomBytes(6).toString('hex')}`;
+    const reconnectToken = crypto.randomBytes(32).toString('hex');
     const assignedColor = this.assignUniqueColor(room);
 
-    const newParticipant: Participant & { socketId: string } = {
-      userId,
+    const newParticipant: RoomParticipantEntity = {
+      userId: newUserId,
       socketId,
+      reconnectToken,
       displayName,
       role: 'MEMBER',
       color: assignedColor,
       connectionState: 'CONNECTED',
-      isMuted: false,
+      isMuted: true,
       isSpeaking: false,
       isTyping: false,
     };
 
-    room.participants.set(userId, newParticipant);
-    this.socketToRoom.set(socketId, { roomId, userId });
+    room.participants.set(newUserId, newParticipant);
+    this.socketToRoom.set(socketId, { roomId, userId: newUserId });
+
+    // If the host's grace period expired while no member was online to promote,
+    // assign host to the first participant who returns.
+    if (
+      room.hostDisconnectedAt !== undefined &&
+      Date.now() - room.hostDisconnectedAt >= this.hostDisconnectGraceMs
+    ) {
+      this.promoteAfterHostGraceIfNeeded(room, newParticipant);
+    }
 
     return {
       room: this.serializeRoom(room),
       participant: this.serializeParticipant(newParticipant),
+      reconnectToken,
       isReconnection: false,
+    };
+  }
+
+  /**
+   * Reconnects an existing participant into their active room.
+   */
+  public reconnectParticipant(
+    request: ReconnectRequest,
+    socketId: string
+  ): { room: RoomState; participant: Participant; reconnectToken: string } {
+    const roomId = request.roomId?.trim();
+    const userId = request.userId?.trim();
+
+    if (!roomId || !userId) {
+      throw new RoomError('INVALID_REQUEST', 'Room ID and User ID are required');
+    }
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      throw new RoomError('ROOM_NOT_FOUND', `Room '${roomId}' does not exist`);
+    }
+
+    const participant = room.participants.get(userId);
+    if (!participant) {
+      throw new RoomError('UNAUTHORIZED', `Participant '${userId}' is not a member of room '${roomId}'`);
+    }
+
+    // Token authenticity check if token is present
+    if (participant.reconnectToken && request.reconnectToken) {
+      if (participant.reconnectToken !== request.reconnectToken) {
+        throw new RoomError('UNAUTHORIZED', 'Invalid reconnect token');
+      }
+    }
+
+    // Unmap any previous socket for this user in this room
+    for (const [sId, ctx] of this.socketToRoom.entries()) {
+      if (ctx.userId === userId && ctx.roomId === roomId && sId !== socketId) {
+        this.socketToRoom.delete(sId);
+      }
+    }
+
+    // Restore participant connection
+    participant.socketId = socketId;
+    participant.connectionState = 'CONNECTED';
+
+    // If host was disconnected, cancel host promotion timer
+    if (room.hostId === userId) {
+      const timer = this.hostPromotionTimers.get(roomId);
+      if (timer) clearTimeout(timer);
+      this.hostPromotionTimers.delete(roomId);
+      room.hostDisconnectedAt = undefined;
+    }
+
+    this.socketToRoom.set(socketId, { roomId, userId });
+
+    return {
+      room: this.serializeRoom(room),
+      participant: this.serializeParticipant(participant),
+      reconnectToken: participant.reconnectToken,
     };
   }
 
@@ -250,18 +362,42 @@ export class RoomManager {
     const participant = room.participants.get(userId);
     if (!participant) return null;
 
-    // Mark as disconnected
+    // Mark as disconnected and clear live cursor/typing
     participant.connectionState = 'DISCONNECTED';
+    participant.isTyping = false;
+    delete participant.cursor;
+    delete participant.selection;
 
-    // If host disconnects, promote earliest joined connected participant if available
+    // Give the host a grace window to reconnect before promoting another participant.
     if (room.hostId === userId) {
-      const nextActive = Array.from(room.participants.values()).find(
-        (p) => p.userId !== userId && p.connectionState === 'CONNECTED'
-      );
-      if (nextActive) {
-        nextActive.role = 'HOST';
-        room.hostId = nextActive.userId;
-      }
+      room.hostDisconnectedAt = Date.now();
+      const existingTimer = this.hostPromotionTimers.get(roomId);
+      if (existingTimer) clearTimeout(existingTimer);
+
+      const timer = setTimeout(() => {
+        this.hostPromotionTimers.delete(roomId);
+        const currentRoom = this.rooms.get(roomId);
+        const disconnectedHost = currentRoom?.participants.get(userId);
+        if (
+          !currentRoom ||
+          currentRoom.hostId !== userId ||
+          disconnectedHost?.connectionState !== 'DISCONNECTED'
+        ) {
+          return;
+        }
+
+        const nextActive = Array.from(currentRoom.participants.values()).find(
+          (p) => p.userId !== userId && p.connectionState === 'CONNECTED'
+        );
+        if (nextActive) {
+          disconnectedHost.role = 'MEMBER';
+          nextActive.role = 'HOST';
+          currentRoom.hostId = nextActive.userId;
+          currentRoom.hostDisconnectedAt = undefined;
+        }
+      }, this.hostDisconnectGraceMs);
+      timer.unref?.();
+      this.hostPromotionTimers.set(roomId, timer);
     }
 
     const remaining = Array.from(room.participants.values())
@@ -272,6 +408,172 @@ export class RoomManager {
       roomId,
       participant: this.serializeParticipant(participant),
       remainingParticipants: remaining,
+    };
+  }
+
+  private promoteAfterHostGraceIfNeeded(room: RoomEntity, candidate: RoomParticipantEntity): void {
+    if (
+      room.hostDisconnectedAt === undefined ||
+      Date.now() - room.hostDisconnectedAt < this.hostDisconnectGraceMs
+    ) {
+      return;
+    }
+
+    const formerHost = room.participants.get(room.hostId);
+    if (!formerHost || formerHost.connectionState !== 'DISCONNECTED') return;
+
+    const timer = this.hostPromotionTimers.get(room.roomId);
+    if (timer) clearTimeout(timer);
+    this.hostPromotionTimers.delete(room.roomId);
+
+    formerHost.role = 'MEMBER';
+    candidate.role = 'HOST';
+    room.hostId = candidate.userId;
+    room.hostDisconnectedAt = undefined;
+  }
+
+  /**
+   * Host Control: Locks the room to prevent non-host edits.
+   */
+  public lockRoom(socketId: string, targetRoomId?: string): RoomState {
+    const context = this.socketToRoom.get(socketId);
+    const roomId = targetRoomId || context?.roomId;
+    if (!roomId) {
+      throw new RoomError('INVALID_REQUEST', 'Not in a room');
+    }
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      throw new RoomError('ROOM_NOT_FOUND', `Room '${roomId}' does not exist`);
+    }
+
+    // Authoritative host validation
+    if (!context || room.hostId !== context.userId) {
+      throw new RoomError('UNAUTHORIZED', 'Only the room host can lock the room');
+    }
+
+    room.isLocked = true;
+    return this.serializeRoom(room);
+  }
+
+  /**
+   * Host Control: Unlocks the room, restoring editing privileges.
+   */
+  public unlockRoom(socketId: string, targetRoomId?: string): RoomState {
+    const context = this.socketToRoom.get(socketId);
+    const roomId = targetRoomId || context?.roomId;
+    if (!roomId) {
+      throw new RoomError('INVALID_REQUEST', 'Not in a room');
+    }
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      throw new RoomError('ROOM_NOT_FOUND', `Room '${roomId}' does not exist`);
+    }
+
+    // Authoritative host validation
+    if (!context || room.hostId !== context.userId) {
+      throw new RoomError('UNAUTHORIZED', 'Only the room host can unlock the room');
+    }
+
+    room.isLocked = false;
+    return this.serializeRoom(room);
+  }
+
+  /**
+   * Host Control: Forcefully ejects a participant from the room.
+   */
+  public removeParticipant(
+    socketId: string,
+    targetUserId: string,
+    targetRoomId?: string
+  ): {
+    roomId: string;
+    targetParticipant: Participant;
+    remainingParticipants: Participant[];
+    targetSocketId: string;
+  } {
+    const context = this.socketToRoom.get(socketId);
+    const roomId = targetRoomId || context?.roomId;
+    if (!roomId) {
+      throw new RoomError('INVALID_REQUEST', 'Not in a room');
+    }
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      throw new RoomError('ROOM_NOT_FOUND', `Room '${roomId}' does not exist`);
+    }
+
+    // Authoritative host validation
+    if (!context || room.hostId !== context.userId) {
+      throw new RoomError('UNAUTHORIZED', 'Only the room host can remove participants');
+    }
+
+    // Host cannot remove themselves
+    if (targetUserId === room.hostId || targetUserId === context.userId) {
+      throw new RoomError('INVALID_REQUEST', 'Host cannot remove themselves from the room');
+    }
+
+    const target = room.participants.get(targetUserId);
+    if (!target) {
+      throw new RoomError('INVALID_REQUEST', 'Target participant not found in this room');
+    }
+
+    const targetSocketId = target.socketId;
+
+    // Clean up participant and socket mappings
+    this.socketToRoom.delete(targetSocketId);
+    room.participants.delete(targetUserId);
+
+    const remaining = Array.from(room.participants.values())
+      .filter((p) => p.connectionState === 'CONNECTED')
+      .map((p) => this.serializeParticipant(p));
+
+    return {
+      roomId,
+      targetParticipant: this.serializeParticipant(target),
+      remainingParticipants: remaining,
+      targetSocketId,
+    };
+  }
+
+  /**
+   * Host Control: Closes and cleanly terminates the room session.
+   */
+  public closeRoom(
+    socketId: string,
+    targetRoomId?: string
+  ): { roomId: string; affectedSocketIds: string[] } {
+    const context = this.socketToRoom.get(socketId);
+    const roomId = targetRoomId || context?.roomId;
+    if (!roomId) {
+      throw new RoomError('INVALID_REQUEST', 'Not in a room');
+    }
+
+    const room = this.rooms.get(roomId);
+    if (!room) {
+      throw new RoomError('ROOM_NOT_FOUND', `Room '${roomId}' does not exist`);
+    }
+
+    // Authoritative host validation
+    if (!context || room.hostId !== context.userId) {
+      throw new RoomError('UNAUTHORIZED', 'Only the room host can close the room');
+    }
+
+    const affectedSocketIds: string[] = [];
+    const hostPromotionTimer = this.hostPromotionTimers.get(roomId);
+    if (hostPromotionTimer) clearTimeout(hostPromotionTimer);
+    this.hostPromotionTimers.delete(roomId);
+    for (const p of room.participants.values()) {
+      affectedSocketIds.push(p.socketId);
+      this.socketToRoom.delete(p.socketId);
+    }
+
+    this.rooms.delete(roomId);
+
+    return {
+      roomId,
+      affectedSocketIds,
     };
   }
 
@@ -299,6 +601,82 @@ export class RoomManager {
   }
 
   /**
+   * Updates participant cursor position and optional selection range.
+   */
+  public updateCursor(
+    socketId: string,
+    position: CursorPosition,
+    selection?: MonacoRange
+  ): { roomId: string; participant: Participant } | null {
+    const mapping = this.socketToRoom.get(socketId);
+    if (!mapping) return null;
+
+    const room = this.rooms.get(mapping.roomId);
+    if (!room) return null;
+
+    const participant = room.participants.get(mapping.userId);
+    if (!participant || participant.connectionState !== 'CONNECTED') return null;
+
+    participant.cursor = {
+      lineNumber: Math.max(1, position.lineNumber),
+      column: Math.max(1, position.column),
+    };
+
+    if (selection) {
+      participant.selection = selection;
+    } else {
+      delete participant.selection;
+    }
+
+    return {
+      roomId: room.roomId,
+      participant: this.serializeParticipant(participant),
+    };
+  }
+
+  /**
+   * Updates participant presence state (typing status, microphone, speaking).
+   */
+  public updatePresence(
+    socketId: string,
+    update: Partial<PresenceUpdatePayload>
+  ): { roomId: string; participant: Participant } | null {
+    const mapping = this.socketToRoom.get(socketId);
+    if (!mapping) return null;
+
+    const room = this.rooms.get(mapping.roomId);
+    if (!room) return null;
+
+    const participant = room.participants.get(mapping.userId);
+    if (!participant || participant.connectionState !== 'CONNECTED') return null;
+
+    if (typeof update.isTyping === 'boolean') {
+      participant.isTyping = update.isTyping;
+    }
+    if (typeof update.isMuted === 'boolean') {
+      participant.isMuted = update.isMuted;
+    }
+    if (typeof update.isSpeaking === 'boolean') {
+      participant.isSpeaking = update.isSpeaking;
+    }
+
+    return {
+      roomId: room.roomId,
+      participant: this.serializeParticipant(participant),
+    };
+  }
+
+  /**
+   * Retrieves the current socket ID for a given user in a room.
+   */
+  public getParticipantSocketId(roomId: string, userId: string): string | null {
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+    const participant = room.participants.get(userId);
+    return participant ? participant.socketId : null;
+  }
+
+  /**
    * Serializes a room entity into public RoomState without sensitive fields.
    */
   private serializeRoom(room: RoomEntity): RoomState {
@@ -318,9 +696,9 @@ export class RoomManager {
   }
 
   /**
-   * Strips internal fields (like socketId) from participant object.
+   * Strips internal fields (like socketId and reconnectToken) from participant object.
    */
-  private serializeParticipant(p: Participant & { socketId: string }): Participant {
+  private serializeParticipant(p: RoomParticipantEntity | (Participant & { socketId: string })): Participant {
     return {
       userId: p.userId,
       displayName: p.displayName,

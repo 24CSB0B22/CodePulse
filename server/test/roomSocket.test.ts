@@ -225,4 +225,204 @@ describe('Room Socket.IO Integration Tests', () => {
     expect(correctPassRes.success).toBe(true);
     expect(correctPassRes.data.participant.displayName).toBe('Guest');
   });
+
+  it('should allow host to lock/unlock room, broadcasting state and rejecting non-host', async () => {
+    const hostSocket = await createClient();
+    const memberSocket = await createClient();
+
+    const createRes: any = await new Promise((r) => {
+      hostSocket.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'AliceHost' }, r);
+    });
+    const roomId = createRes.data.room.roomId;
+
+    await new Promise((r) => {
+      memberSocket.emit(SOCKET_EVENTS.ROOM_JOIN, { roomId, displayName: 'BobMember' }, r);
+    });
+
+    // 1. Non-host attempts to lock room
+    const nonHostLockRes: any = await new Promise((r) => {
+      memberSocket.emit(SOCKET_EVENTS.ROOM_LOCK, { roomId }, r);
+    });
+    expect(nonHostLockRes.success).toBe(false);
+    expect(nonHostLockRes.error.code).toBe('UNAUTHORIZED');
+
+    // 2. Member listens for room:lock broadcast
+    const lockBroadcastPromise = new Promise<{ roomId: string; isLocked: boolean }>((r) => {
+      memberSocket.on(SOCKET_EVENTS.ROOM_LOCK, r);
+    });
+
+    // 3. Host locks room
+    const hostLockRes: any = await new Promise((r) => {
+      hostSocket.emit(SOCKET_EVENTS.ROOM_LOCK, { roomId }, r);
+    });
+    expect(hostLockRes.success).toBe(true);
+    expect(hostLockRes.data.room.isLocked).toBe(true);
+
+    const lockBroadcast = await lockBroadcastPromise;
+    expect(lockBroadcast.isLocked).toBe(true);
+
+    // 4. Host unlocks room
+    const unlockBroadcastPromise = new Promise<{ roomId: string; isLocked: boolean }>((r) => {
+      memberSocket.on(SOCKET_EVENTS.ROOM_UNLOCK, r);
+    });
+
+    const hostUnlockRes: any = await new Promise((r) => {
+      hostSocket.emit(SOCKET_EVENTS.ROOM_UNLOCK, { roomId }, r);
+    });
+    expect(hostUnlockRes.success).toBe(true);
+    expect(hostUnlockRes.data.room.isLocked).toBe(false);
+
+    const unlockBroadcast = await unlockBroadcastPromise;
+    expect(unlockBroadcast.isLocked).toBe(false);
+  });
+
+  it('should allow host to remove participant, notifying target and remaining participants', async () => {
+    const hostSocket = await createClient();
+    const memberSocket = await createClient();
+    const observerSocket = await createClient();
+
+    const createRes: any = await new Promise((r) => {
+      hostSocket.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'Host' }, r);
+    });
+    const roomId = createRes.data.room.roomId;
+
+    const bobJoinRes: any = await new Promise((r) => {
+      memberSocket.emit(SOCKET_EVENTS.ROOM_JOIN, { roomId, displayName: 'Bob' }, r);
+    });
+    const bobId = bobJoinRes.data.participant.userId;
+
+    await new Promise((r) => {
+      observerSocket.emit(SOCKET_EVENTS.ROOM_JOIN, { roomId, displayName: 'Charlie' }, r);
+    });
+
+    // Target member listens for participant:remove
+    const targetRemovedPromise = new Promise<{ roomId: string; message: string }>((r) => {
+      memberSocket.on(SOCKET_EVENTS.PARTICIPANT_REMOVE, r);
+    });
+
+    // Observer listens for participant:left
+    const observerNotifiedPromise = new Promise<ParticipantLeftPayload>((r) => {
+      observerSocket.on(SOCKET_EVENTS.PARTICIPANT_LEFT, r);
+    });
+
+    // Non-host attempts remove
+    const nonHostRemoveRes: any = await new Promise((r) => {
+      observerSocket.emit(SOCKET_EVENTS.PARTICIPANT_REMOVE, { roomId, targetUserId: bobId }, r);
+    });
+    expect(nonHostRemoveRes.success).toBe(false);
+    expect(nonHostRemoveRes.error.code).toBe('UNAUTHORIZED');
+
+    // Host removes Bob
+    const hostRemoveRes: any = await new Promise((r) => {
+      hostSocket.emit(SOCKET_EVENTS.PARTICIPANT_REMOVE, { roomId, targetUserId: bobId }, r);
+    });
+    expect(hostRemoveRes.success).toBe(true);
+
+    const targetNotice = await targetRemovedPromise;
+    expect(targetNotice.roomId).toBe(roomId);
+
+    const leftNotice = await observerNotifiedPromise;
+    expect(leftNotice.userId).toBe(bobId);
+    expect(leftNotice.reason).toBe('Removed by host');
+  });
+
+  it('should allow host to close room, notifying all participants and cleaning up room channel', async () => {
+    const hostSocket = await createClient();
+    const memberSocket = await createClient();
+
+    const createRes: any = await new Promise((r) => {
+      hostSocket.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'Host' }, r);
+    });
+    const roomId = createRes.data.room.roomId;
+
+    await new Promise((r) => {
+      memberSocket.emit(SOCKET_EVENTS.ROOM_JOIN, { roomId, displayName: 'Member' }, r);
+    });
+
+    const memberClosePromise = new Promise<{ roomId: string; reason: string }>((r) => {
+      memberSocket.on(SOCKET_EVENTS.ROOM_CLOSE, r);
+    });
+
+    // Host closes room
+    const closeRes: any = await new Promise((r) => {
+      hostSocket.emit(SOCKET_EVENTS.ROOM_CLOSE, { roomId }, r);
+    });
+    expect(closeRes.success).toBe(true);
+
+    const closeNotice = await memberClosePromise;
+    expect(closeNotice.roomId).toBe(roomId);
+    expect(closeNotice.reason).toBe('Room has been closed by host');
+  });
+
+  it('should broadcast cursor:update to peers when collaborator moves cursor', async () => {
+    const userA = await createClient();
+    const userB = await createClient();
+
+    const createRes: any = await new Promise((r) => {
+      userA.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'UserA' }, r);
+    });
+    const roomId = createRes.data.room.roomId;
+
+    const joinRes: any = await new Promise((r) => {
+      userB.emit(SOCKET_EVENTS.ROOM_JOIN, { roomId, displayName: 'UserB' }, r);
+    });
+    const userBId = joinRes.data.participant.userId;
+
+    const cursorPromise = new Promise<any>((resolve) => {
+      userA.on(SOCKET_EVENTS.CURSOR_UPDATE, resolve);
+    });
+
+    // User B emits cursor:update
+    userB.emit(SOCKET_EVENTS.CURSOR_UPDATE, {
+      roomId,
+      position: { lineNumber: 4, column: 15 },
+      selection: { startLineNumber: 4, startColumn: 1, endLineNumber: 4, endColumn: 15 },
+    });
+
+    const cursorUpdate = await cursorPromise;
+    expect(cursorUpdate.userId).toBe(userBId);
+    expect(cursorUpdate.displayName).toBe('UserB');
+    expect(cursorUpdate.position).toEqual({ lineNumber: 4, column: 15 });
+    expect(cursorUpdate.selection).toEqual({
+      startLineNumber: 4,
+      startColumn: 1,
+      endLineNumber: 4,
+      endColumn: 15,
+    });
+  });
+
+  it('should broadcast presence:update to all room members when typing or mic toggles', async () => {
+    const userA = await createClient();
+    const userB = await createClient();
+
+    const createRes: any = await new Promise((r) => {
+      userA.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'UserA' }, r);
+    });
+    const roomId = createRes.data.room.roomId;
+
+    const joinRes: any = await new Promise((r) => {
+      userB.emit(SOCKET_EVENTS.ROOM_JOIN, { roomId, displayName: 'UserB' }, r);
+    });
+    const userBId = joinRes.data.participant.userId;
+
+    const presencePromise = new Promise<any>((resolve) => {
+      userA.on(SOCKET_EVENTS.PRESENCE_UPDATE, (p) => {
+        if (p.userId === userBId && p.isTyping !== undefined) {
+          resolve(p);
+        }
+      });
+    });
+
+    // User B emits typing presence update
+    userB.emit(SOCKET_EVENTS.PRESENCE_UPDATE, {
+      roomId,
+      isTyping: true,
+      isMuted: true,
+    });
+
+    const presenceUpdate = await presencePromise;
+    expect(presenceUpdate.userId).toBe(userBId);
+    expect(presenceUpdate.isTyping).toBe(true);
+    expect(presenceUpdate.isMuted).toBe(true);
+  });
 });

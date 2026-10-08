@@ -12,6 +12,9 @@ export function getSocket(): Socket {
       reconnectionAttempts: 5,
       reconnectionDelay: 1000,
     });
+    if (typeof window !== 'undefined') {
+      (window as any).__synccode_socket = socketInstance;
+    }
   }
   return socketInstance;
 }

@@ -36,6 +36,11 @@ export const MonacoEditorPane: React.FC<MonacoEditorPaneProps> = ({
       initialRevision,
       onStatusChange
     );
+
+    if (typeof window !== 'undefined') {
+      (window as any).__monacoEditor = editorInstance;
+      (window as any).__syncManager = syncManagerRef.current;
+    }
   };
 
   useEffect(() => {
@@ -44,8 +49,18 @@ export const MonacoEditorPane: React.FC<MonacoEditorPaneProps> = ({
         syncManagerRef.current.destroy();
         syncManagerRef.current = null;
       }
+      if (typeof window !== 'undefined') {
+        delete (window as any).__monacoEditor;
+        delete (window as any).__syncManager;
+      }
     };
   }, []);
+
+  useEffect(() => {
+    if (syncManagerRef.current) {
+      syncManagerRef.current.syncToDocument(initialContent, initialRevision);
+    }
+  }, [initialContent, initialRevision]);
 
   // Map internal language identifiers to Monaco language IDs
   const monacoLanguage =

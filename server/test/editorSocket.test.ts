@@ -159,4 +159,53 @@ describe('Editor Socket.IO Integration & Network Tests', () => {
     expect(syncPayload.type).toBe('DELTA');
     expect(syncPayload.operations).toHaveLength(1);
   });
+
+  it('should reject editor:sync requests from sockets outside the requested room', async () => {
+    const host = await createClient();
+    const stranger = await createClient();
+    const createRes: any = await new Promise((resolve) => {
+      host.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'PrivateHost' }, resolve);
+    });
+
+    const response: any = await new Promise((resolve) => {
+      stranger.emit(
+        SOCKET_EVENTS.EDITOR_SYNC,
+        { roomId: createRes.data.room.roomId, lastKnownRevision: 0 },
+        resolve
+      );
+    });
+
+    expect(response.success).toBe(false);
+    expect(response.error).toBe('NOT_IN_A_ROOM');
+  });
+
+  it('should reject editor:sync requests that target a different room', async () => {
+    const hostA = await createClient();
+    const hostB = await createClient();
+    const createA: any = await new Promise((resolve) => {
+      hostA.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'HostA' }, resolve);
+    });
+    const createB: any = await new Promise((resolve) => {
+      hostB.emit(SOCKET_EVENTS.ROOM_CREATE, { displayName: 'HostB' }, resolve);
+    });
+
+    const response: any = await new Promise((resolve) => {
+      hostA.emit(
+        SOCKET_EVENTS.EDITOR_SYNC,
+        { roomId: createA.data.room.roomId, lastKnownRevision: 0 },
+        resolve
+      );
+    });
+    expect(response.success).toBe(true);
+
+    const wrongRoomResponse: any = await new Promise((resolve) => {
+      hostA.emit(
+        SOCKET_EVENTS.EDITOR_SYNC,
+        { roomId: createB.data.room.roomId, lastKnownRevision: 0 },
+        resolve
+      );
+    });
+    expect(wrongRoomResponse.success).toBe(false);
+    expect(wrongRoomResponse.error).toBe('UNAUTHORIZED');
+  });
 });

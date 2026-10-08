@@ -1,27 +1,65 @@
-import React, { useState } from 'react';
-import { RoomState, Participant } from '@synccode/shared';
+import React, { useState, useEffect, useRef } from 'react';
+import { RoomState, Participant, ChatMessage } from '@synccode/shared';
 import { RoomHeader } from './RoomHeader';
 import { ParticipantList } from './ParticipantList';
 import { MonacoEditorPane } from '../editor/MonacoEditorPane';
+import { ChatPanel } from '../chat/ChatPanel';
 import { SyncStatus } from '../../collaboration/SyncManager';
 import { Code2, CheckCircle2, RefreshCw } from 'lucide-react';
 
 interface WorkspaceViewProps {
   roomState: RoomState;
   currentParticipant: Participant;
+  chatMessages: ChatMessage[];
+  isReconnecting?: boolean;
+  onSendMessage: (content: string) => Promise<{ success: boolean; error?: string }>;
   onLeaveRoom: () => void;
+  onToggleLock?: () => void;
+  onCloseRoom?: () => void;
+  onRemoveParticipant?: (userId: string) => void;
+  onToggleMic?: () => void;
 }
 
 export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   roomState,
   currentParticipant,
+  chatMessages,
+  isReconnecting,
+  onSendMessage,
   onLeaveRoom,
+  onToggleLock,
+  onCloseRoom,
+  onRemoveParticipant,
+  onToggleMic,
 }) => {
   const [syncStatus, setSyncStatus] = useState<SyncStatus>({
     revision: roomState.document.currentRevision,
     pendingCount: 0,
     isSynced: true,
   });
+
+  const [isChatOpen, setIsChatOpen] = useState(true);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const prevMessagesLengthRef = useRef(chatMessages.length);
+
+  useEffect(() => {
+    if (isChatOpen) {
+      setUnreadCount(0);
+    } else if (chatMessages.length > prevMessagesLengthRef.current) {
+      setUnreadCount((prev) => prev + (chatMessages.length - prevMessagesLengthRef.current));
+    }
+    prevMessagesLengthRef.current = chatMessages.length;
+  }, [chatMessages, isChatOpen]);
+
+  const handleToggleChat = () => {
+    setIsChatOpen((prev) => {
+      const next = !prev;
+      if (next) setUnreadCount(0);
+      return next;
+    });
+  };
+
+  const isHost = currentParticipant.role === 'HOST';
 
   return (
     <div className="flex-1 flex flex-col h-screen overflow-hidden bg-slate-950">
@@ -32,8 +70,25 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
         participantCount={roomState.participants.length}
         maxParticipants={roomState.maxParticipants}
         isLocked={roomState.isLocked}
+        isHost={isHost}
+        isChatOpen={isChatOpen}
+        unreadChatCount={unreadCount}
+        isMuted={currentParticipant.isMuted}
+        isSpeaking={currentParticipant.isSpeaking}
+        onToggleMic={onToggleMic}
+        onToggleChat={handleToggleChat}
+        onToggleLock={onToggleLock}
+        onCloseRoom={onCloseRoom}
         onLeaveRoom={onLeaveRoom}
       />
+
+      {/* Reconnecting Status Banner */}
+      {isReconnecting && (
+        <div className="bg-amber-950/80 border-b border-amber-800/80 px-4 py-1.5 flex items-center justify-center gap-2 text-xs font-medium text-amber-300 shrink-0">
+          <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+          <span>Reconnecting... Local state preserved.</span>
+        </div>
+      )}
 
       {/* Main Split Layout */}
       <div className="flex-1 flex flex-col sm:flex-row overflow-hidden">
@@ -42,6 +97,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
           participants={roomState.participants}
           currentUserId={currentParticipant.userId}
           maxParticipants={roomState.maxParticipants}
+          isHost={isHost}
+          onRemoveParticipant={onRemoveParticipant}
+          onToggleMic={onToggleMic}
         />
 
         {/* Center: Monaco Collaborative Editor */}
@@ -95,6 +153,16 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
             </div>
           </footer>
         </main>
+
+        {/* Right: Room Chat */}
+        {isChatOpen && (
+          <ChatPanel
+            messages={chatMessages}
+            currentUserId={currentParticipant.userId}
+            onSendMessage={onSendMessage}
+            onClose={() => setIsChatOpen(false)}
+          />
+        )}
       </div>
     </div>
   );

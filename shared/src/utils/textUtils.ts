@@ -1,4 +1,38 @@
-import { MonacoRange } from '../types/operations';
+import { EditOperation, MonacoRange } from '../types/operations';
+
+export interface CreateEditOperationInput {
+  operationId: string;
+  userId: string;
+  roomId: string;
+  baseRevision: number;
+  range: MonacoRange;
+  rangeOffset: number;
+  rangeLength: number;
+  insertedText: string;
+  baseContent: string;
+  timestamp: number;
+  clientSequence: number;
+}
+
+/** Builds a Monaco delta using the pre-edit buffer to capture exact deleted text. */
+export function createEditOperation(input: CreateEditOperationInput): EditOperation {
+  const start = Math.max(0, Math.min(input.rangeOffset, input.baseContent.length));
+  const end = Math.max(start, Math.min(start + input.rangeLength, input.baseContent.length));
+
+  return {
+    operationId: input.operationId,
+    userId: input.userId,
+    roomId: input.roomId,
+    baseRevision: input.baseRevision,
+    range: input.range,
+    insertedText: input.insertedText,
+    deletedText: input.baseContent.slice(start, end),
+    deleteCount: input.rangeLength,
+    rangeLength: input.rangeLength,
+    timestamp: input.timestamp,
+    clientSequence: input.clientSequence,
+  };
+}
 
 /**
  * Converts a 1-indexed (line, column) Monaco coordinate to a 0-indexed character offset.

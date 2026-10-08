@@ -22,4 +22,16 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    chunkSizeWarningLimit: 4500,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-react': ['react', 'react-dom'],
+          'vendor-socket': ['socket.io-client'],
+          'monaco-editor': ['monaco-editor'],
+        },
+      },
+    },
+  },
 });

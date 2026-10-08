@@ -3,20 +3,50 @@ import cors from 'cors';
 import helmet from 'helmet';
 import { ENV } from './config/env';
 import { errorHandler, notFoundHandler } from './middleware/errorHandler';
+import { executionRouter } from './routes/executionRoutes';
 
 export function createApp(): Application {
   const app = express();
 
-  // Basic security and CORS headers
+  const isProd = ENV.NODE_ENV === 'production';
+  const allowedOrigins = isProd
+    ? [ENV.CLIENT_ORIGIN]
+    : [ENV.CLIENT_ORIGIN, 'http://localhost:5173', 'http://127.0.0.1:5173', 'http://localhost:3000'];
+
+  // Content-Security-Policy & Security Headers
   app.use(
     helmet({
-      contentSecurityPolicy: false, // For easier dev iframe / asset loading
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          scriptSrc: [
+            "'self'",
+            "'unsafe-inline'", // Monaco editor inline initialization & scripts
+            "'unsafe-eval'", // Monaco dynamic web worker evaluation
+          ],
+          styleSrc: ["'self'", "'unsafe-inline'"], // Monaco & Tailwind dynamic styling
+          imgSrc: ["'self'", 'data:', 'blob:'],
+          fontSrc: ["'self'", 'data:'],
+          connectSrc: [
+            "'self'",
+            'ws:',
+            'wss:',
+            'blob:',
+            ENV.CLIENT_ORIGIN,
+            ...(isProd ? [] : ['http://localhost:5173', 'ws://localhost:5173', 'http://127.0.0.1:5173', 'ws://127.0.0.1:5173']),
+          ],
+          workerSrc: ["'self'", 'blob:'], // Monaco editor background workers
+          childSrc: ["'self'", 'blob:'],
+          objectSrc: ["'none'"],
+        },
+      },
+      crossOriginEmbedderPolicy: false,
     })
   );
 
   app.use(
     cors({
-      origin: [ENV.CLIENT_ORIGIN, 'http://localhost:5173', 'http://127.0.0.1:5173'],
+      origin: allowedOrigins,
       credentials: true,
     })
   );
@@ -34,6 +64,9 @@ export function createApp(): Application {
       environment: ENV.NODE_ENV,
     });
   });
+
+  // Sandboxed Code Execution routes
+  app.use('/api/v1/execution', executionRouter);
 
   // Catch 404s
   app.use(notFoundHandler);

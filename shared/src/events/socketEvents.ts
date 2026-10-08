@@ -15,6 +15,7 @@ export const SOCKET_EVENTS = {
   ROOM_LEAVE: 'room:leave',
   ROOM_STATE: 'room:state',
   ROOM_LOCK: 'room:lock',
+  ROOM_UNLOCK: 'room:unlock',
   ROOM_CLOSE: 'room:close',
   ROOM_ERROR: 'room:error',
 

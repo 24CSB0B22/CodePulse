@@ -14,12 +14,16 @@ export interface OperationResult {
   ack?: OperationAck;
   requiresSync?: boolean;
   syncPayload?: EditorSyncPayload;
+  isDuplicate?: boolean;
   error?: string;
 }
 
 export class SyncEngine {
   // Retains up to 500 recent operations per room for delta rebase and recovery
   private operationLogs: Map<string, BroadcastEditOperation[]> = new Map();
+
+  // Tracks processed operation IDs and their acks for idempotency / duplicate detection
+  private processedOperationAcks: Map<string, OperationAck> = new Map();
 
   // Sequential execution queue per room to serialize concurrent operations
   private roomQueues: Map<string, Promise<any>> = new Map();
@@ -72,6 +76,16 @@ export class SyncEngine {
       return { success: false, error: 'ROOM_IS_LOCKED' };
     }
 
+    // Duplicate operation check using operationId
+    const existingAck = this.processedOperationAcks.get(operation.operationId);
+    if (existingAck) {
+      return {
+        success: true,
+        ack: existingAck,
+        isDuplicate: true,
+      };
+    }
+
     // 3. Validate Operation Structure
     if (
       !operation.operationId ||
@@ -86,6 +100,13 @@ export class SyncEngine {
       typeof operation.deletedText !== 'string'
     ) {
       return { success: false, error: 'INVALID_OPERATION_PAYLOAD' };
+    }
+
+    if (
+      operation.insertedText.length > 50_000 ||
+      operation.deletedText.length > 50_000
+    ) {
+      return { success: false, error: 'OPERATION_TOO_LARGE' };
     }
 
     const doc = room.document;
@@ -114,7 +135,11 @@ export class SyncEngine {
 
     if (operation.baseRevision < currentRevision) {
       // Client is editing against a stale revision -> attempt to transform
-      const interveningOps = log.filter((op) => op.revision > operation.baseRevision);
+      // Only rebase against intervening operations from OTHER users.
+      // The sender's local buffer already optimistically includes their own pending edits.
+      const interveningOps = log.filter(
+        (op) => op.revision > operation.baseRevision && op.userId !== operation.userId
+      );
 
       let transformedRange = { ...targetRange };
       let rebaseSuccess = true;
@@ -197,6 +222,13 @@ export class SyncEngine {
       clientSequence: operation.clientSequence,
     };
 
+    // Retain processed operation ack for duplicate detection
+    this.processedOperationAcks.set(operation.operationId, ack);
+    if (this.processedOperationAcks.size > 2000) {
+      const firstKey = this.processedOperationAcks.keys().next().value;
+      if (firstKey) this.processedOperationAcks.delete(firstKey);
+    }
+
     return {
       success: true,
       broadcastOp,
@@ -224,8 +256,14 @@ export class SyncEngine {
     }
 
     // Check if all missing operations exist in the log
-    const oldestInLog = log.length > 0 ? log[0].revision : 0;
-    if (lastKnownRevision >= oldestInLog - 1) {
+    // We can only replay deltas if the log contains the next needed revision (lastKnownRevision + 1)
+    const canReplayDeltas =
+      log.length > 0 &&
+      lastKnownRevision >= 0 &&
+      lastKnownRevision < doc.currentRevision &&
+      log[0].revision <= lastKnownRevision + 1;
+
+    if (canReplayDeltas) {
       const missedOps = log.filter((op) => op.revision > lastKnownRevision);
       return {
         type: 'DELTA',
@@ -234,12 +272,27 @@ export class SyncEngine {
       };
     }
 
-    // Stale beyond operation log memory -> return full snapshot
+    // Stale beyond operation log memory or uninitialized -> return full snapshot
     return {
       type: 'SNAPSHOT',
       currentRevision: doc.currentRevision,
       snapshotContent: doc.content,
     };
+  }
+
+  public clearOperationLog(roomId: string): void {
+    this.operationLogs.delete(roomId);
+  }
+
+  public trimOperationLog(roomId: string, keepCount: number): void {
+    const log = this.operationLogs.get(roomId);
+    if (log && log.length > keepCount) {
+      this.operationLogs.set(roomId, log.slice(log.length - keepCount));
+    }
+  }
+
+  public clearProcessedOperations(): void {
+    this.processedOperationAcks.clear();
   }
 }
 
