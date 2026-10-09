@@ -44,9 +44,29 @@ export function createApp(): Application {
     })
   );
 
+  const isAllowedOrigin = (origin: string | undefined): boolean => {
+    if (!origin) return true;
+    if (isProd) {
+      return origin === ENV.CLIENT_ORIGIN;
+    }
+    if (allowedOrigins.includes(origin)) {
+      return true;
+    }
+    // Allow LAN origins for multi-device testing (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
+    return /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$/.test(
+      origin
+    );
+  };
+
   app.use(
     cors({
-      origin: allowedOrigins,
+      origin: (origin, callback) => {
+        if (isAllowedOrigin(origin)) {
+          callback(null, true);
+        } else {
+          callback(null, false);
+        }
+      },
       credentials: true,
     })
   );

@@ -240,6 +240,7 @@ export const App: React.FC = () => {
               if (syncMgr) {
                 syncMgr.flushPendingOperations();
               }
+              voiceManagerRef.current?.handleReconnected();
               addNotification('info', 'Reconnected to workspace successfully.');
             }
           }

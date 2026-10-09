@@ -23,6 +23,9 @@ interface PeerRecord {
   audioElement?: HTMLAudioElement;
   queuedCandidates: RTCIceCandidateInit[];
   isRemoteDescriptionSet: boolean;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isPolite: boolean;
 }
 
 const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
@@ -116,6 +119,11 @@ export class VoiceManager {
         });
       }
 
+      // Ensure local tracks are attached to all existing peer connections
+      for (const peerRecord of this.peers.values()) {
+        this.ensureLocalTracks(peerRecord);
+      }
+
       // Notify room presence that microphone state changed
       this.socket.emit(SOCKET_EVENTS.PRESENCE_UPDATE, {
         roomId: this.roomId,
@@ -140,12 +148,22 @@ export class VoiceManager {
       });
 
       // 4. Initiate WebRTC peer connection offers to any existing peers
+      const targetPeers = new Set<string>();
       if (res && res.peers && Array.isArray(res.peers)) {
         for (const peerUserId of res.peers) {
           if (peerUserId !== this.currentUserId) {
-            await this.initiateCallToPeer(peerUserId);
+            targetPeers.add(peerUserId);
           }
         }
+      }
+      for (const peerUserId of this.peers.keys()) {
+        if (peerUserId !== this.currentUserId) {
+          targetPeers.add(peerUserId);
+        }
+      }
+
+      for (const peerUserId of targetPeers) {
+        await this.initiateCallToPeer(peerUserId);
       }
 
       this.emitStatus(null);
@@ -176,6 +194,9 @@ export class VoiceManager {
     this.isMuted = !this.isMuted;
     this.localStream.getAudioTracks().forEach((track) => {
       track.enabled = !this.isMuted;
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}] Local audio track ${track.id} enabled=${track.enabled}`
+      );
     });
 
     if (this.isMuted && this.isSpeaking) {
@@ -257,17 +278,75 @@ export class VoiceManager {
   }
 
   /**
+   * Ensures local audio tracks are attached to the peer connection senders.
+   */
+  private ensureLocalTracks(peerRecord: PeerRecord): void {
+    if (!this.localStream) return;
+    const pc = peerRecord.pc;
+    const senders = typeof pc.getSenders === 'function' ? pc.getSenders() : [];
+
+    for (const track of this.localStream.getAudioTracks()) {
+      const existingSender = senders.find(
+        (s) => s.track === track || (s.track && s.track.kind === 'audio')
+      );
+
+      if (!existingSender) {
+        pc.addTrack(track, this.localStream);
+        console.log(
+          `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerRecord.userId}] Added local audio track ${track.id} (enabled: ${track.enabled}, readyState: ${track.readyState})`
+        );
+      } else if (existingSender.track !== track) {
+        if (typeof existingSender.replaceTrack === 'function') {
+          existingSender.replaceTrack(track).catch((err) => {
+            console.warn(
+              `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerRecord.userId}] Failed to replaceTrack:`,
+              err
+            );
+          });
+          console.log(
+            `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerRecord.userId}] Replaced local audio track with ${track.id} (enabled: ${track.enabled}, readyState: ${track.readyState})`
+          );
+        }
+      } else {
+        console.log(
+          `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerRecord.userId}] Audio sender track state: id=${track.id}, enabled=${track.enabled}, readyState=${track.readyState}`
+        );
+      }
+    }
+  }
+
+  /**
    * Creates RTCPeerConnection and initiates SDP Offer to a target peer.
    */
   private async initiateCallToPeer(targetUserId: string): Promise<void> {
     const peerRecord = this.getOrCreatePeerRecord(targetUserId);
+    this.ensureLocalTracks(peerRecord);
     const pc = peerRecord.pc;
 
+    if (peerRecord.makingOffer || pc.signalingState !== 'stable') {
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${targetUserId}] Skipping initiateCallToPeer: makingOffer=${peerRecord.makingOffer}, signalingState=${pc.signalingState}`
+      );
+      return;
+    }
+
     try {
+      peerRecord.makingOffer = true;
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${targetUserId}] Initiating offer. signalingState before: ${pc.signalingState}`
+      );
+
       const offer = await pc.createOffer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: false,
       });
+
+      if (pc.signalingState !== 'stable') {
+        console.warn(
+          `[VoiceManager] [local: ${this.currentUserId}, remote: ${targetUserId}] Aborting offer creation: signalingState transitioned to ${pc.signalingState}`
+        );
+        return;
+      }
 
       await pc.setLocalDescription(offer);
 
@@ -282,8 +361,16 @@ export class VoiceManager {
       };
 
       this.socket.emit(SOCKET_EVENTS.VOICE_OFFER, offerPayload);
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${targetUserId}] Sent offer successfully. Current signalingState: ${pc.signalingState}`
+      );
     } catch (err) {
-      console.error(`[VoiceManager] Failed to create offer to peer ${targetUserId}:`, err);
+      console.error(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${targetUserId}] Failed to create offer:`,
+        err
+      );
+    } finally {
+      peerRecord.makingOffer = false;
     }
   }
 
@@ -299,30 +386,60 @@ export class VoiceManager {
   }
 
   /**
-   * Handles incoming remote SDP offer from a peer.
+   * Handles incoming remote SDP offer from a peer using the Perfect Negotiation pattern.
    */
   private async handleRemoteOffer(payload: VoiceOfferPayload): Promise<void> {
     if (payload.targetUserId !== this.currentUserId) return;
     const peerUserId = payload.callerUserId;
 
     const peerRecord = this.getOrCreatePeerRecord(peerUserId);
+    this.ensureLocalTracks(peerRecord);
     const pc = peerRecord.pc;
 
+    console.log(
+      `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Received offer. Current signalingState: ${pc.signalingState}, makingOffer: ${peerRecord.makingOffer}, isPolite: ${peerRecord.isPolite}`
+    );
+
+    // Check for glare / offer collision
+    const offerCollision = peerRecord.makingOffer || pc.signalingState !== 'stable';
+
+    peerRecord.ignoreOffer = !peerRecord.isPolite && offerCollision;
+    if (peerRecord.ignoreOffer) {
+      console.warn(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Glare detected: Impolite peer ignoring colliding remote offer.`
+      );
+      return;
+    }
+
     try {
+      if (offerCollision) {
+        console.log(
+          `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Glare detected: Polite peer rolling back local offer to accept remote offer.`
+        );
+        await pc.setLocalDescription({ type: 'rollback' });
+      }
+
       const remoteDesc = new RTCSessionDescription({
         type: payload.description.type as RTCSdpType,
         sdp: payload.description.sdp,
       });
 
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Applying offer, signalingState before: ${pc.signalingState}`
+      );
       await pc.setRemoteDescription(remoteDesc);
       peerRecord.isRemoteDescriptionSet = true;
 
       // Drain any queued ICE candidates
       await this.drainQueuedCandidates(peerRecord);
 
-      // Create and send SDP answer
+      // Create and set local answer
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
+
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Created and set answer, signalingState: ${pc.signalingState}`
+      );
 
       const answerPayload: VoiceAnswerPayload = {
         roomId: this.roomId,
@@ -336,19 +453,44 @@ export class VoiceManager {
 
       this.socket.emit(SOCKET_EVENTS.VOICE_ANSWER, answerPayload);
     } catch (err) {
-      console.error(`[VoiceManager] Failed to handle offer from ${peerUserId}:`, err);
+      console.error(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Failed to handle remote offer:`,
+        err
+      );
     }
   }
 
   /**
    * Handles incoming remote SDP answer from a peer.
+   * Only calls setRemoteDescription when in 'have-local-offer' state.
    */
   private async handleRemoteAnswer(payload: VoiceAnswerPayload): Promise<void> {
     if (payload.targetUserId !== this.currentUserId) return;
     const peerUserId = payload.answererUserId;
 
     const peerRecord = this.peers.get(peerUserId);
-    if (!peerRecord) return;
+    if (!peerRecord) {
+      console.warn(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Received answer for non-existent peer record.`
+      );
+      return;
+    }
+
+    const pc = peerRecord.pc;
+    const belongsToCurrentNegotiation = pc.signalingState === 'have-local-offer';
+
+    console.log(
+      `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Received answer. Current signalingState: ${pc.signalingState}. Belongs to current negotiation: ${belongsToCurrentNegotiation}`
+    );
+
+    // Requirement 2: Call setRemoteDescription(answer) only when the corresponding peer connection is in have-local-offer state.
+    // Prevent duplicate or stale answers from being applied.
+    if (!belongsToCurrentNegotiation) {
+      console.warn(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Stale or duplicate answer ignored. signalingState before: '${pc.signalingState}'. Belongs to current negotiation: false`
+      );
+      return;
+    }
 
     try {
       const remoteDesc = new RTCSessionDescription({
@@ -356,12 +498,21 @@ export class VoiceManager {
         sdp: payload.description.sdp,
       });
 
-      await peerRecord.pc.setRemoteDescription(remoteDesc);
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Applying answer, signalingState before: ${pc.signalingState}`
+      );
+      await pc.setRemoteDescription(remoteDesc);
       peerRecord.isRemoteDescriptionSet = true;
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Remote answer applied successfully. New signalingState: ${pc.signalingState}`
+      );
 
       await this.drainQueuedCandidates(peerRecord);
     } catch (err) {
-      console.error(`[VoiceManager] Failed to set remote answer from ${peerUserId}:`, err);
+      console.error(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Failed to set remote answer:`,
+        err
+      );
     }
   }
 
@@ -373,7 +524,12 @@ export class VoiceManager {
     const peerUserId = payload.senderUserId;
 
     const peerRecord = this.peers.get(peerUserId);
-    if (!peerRecord) return;
+    if (!peerRecord) {
+      console.warn(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Received ICE candidate for unknown peer.`
+      );
+      return;
+    }
 
     const candidateInit: RTCIceCandidateInit = {
       candidate: payload.candidate.candidate,
@@ -382,25 +538,40 @@ export class VoiceManager {
       usernameFragment: payload.candidate.usernameFragment,
     };
 
-    if (peerRecord.isRemoteDescriptionSet) {
+    if (peerRecord.isRemoteDescriptionSet && peerRecord.pc.remoteDescription) {
       try {
         await peerRecord.pc.addIceCandidate(new RTCIceCandidate(candidateInit));
       } catch (err) {
-        console.error(`[VoiceManager] Failed to add ICE candidate:`, err);
+        if (!peerRecord.ignoreOffer) {
+          console.warn(
+            `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Failed to add ICE candidate:`,
+            err
+          );
+        }
       }
     } else {
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Queued ICE candidate (waiting for remote description).`
+      );
       peerRecord.queuedCandidates.push(candidateInit);
     }
   }
 
   private async drainQueuedCandidates(peerRecord: PeerRecord): Promise<void> {
+    if (!peerRecord.isRemoteDescriptionSet || !peerRecord.pc.remoteDescription) return;
+
     while (peerRecord.queuedCandidates.length > 0) {
       const cand = peerRecord.queuedCandidates.shift();
       if (cand) {
         try {
           await peerRecord.pc.addIceCandidate(new RTCIceCandidate(cand));
         } catch (err) {
-          console.error('[VoiceManager] Failed to add queued ICE candidate:', err);
+          if (!peerRecord.ignoreOffer) {
+            console.warn(
+              `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerRecord.userId}] Failed to add queued ICE candidate:`,
+              err
+            );
+          }
         }
       }
     }
@@ -411,20 +582,36 @@ export class VoiceManager {
    */
   private getOrCreatePeerRecord(peerUserId: string): PeerRecord {
     let record = this.peers.get(peerUserId);
-    if (record) return record;
+    if (record && record.pc.connectionState !== 'closed') {
+      this.ensureLocalTracks(record);
+      return record;
+    }
+
+    if (record) {
+      this.removePeer(peerUserId);
+    }
 
     const pc = new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS });
+    const isPolite = this.currentUserId > peerUserId;
 
-    // Add local audio tracks to peer connection
-    if (this.localStream) {
-      this.localStream.getTracks().forEach((track) => {
-        pc.addTrack(track, this.localStream!);
-      });
-    }
+    record = {
+      userId: peerUserId,
+      pc,
+      queuedCandidates: [],
+      isRemoteDescriptionSet: false,
+      makingOffer: false,
+      ignoreOffer: false,
+      isPolite,
+    };
+
+    this.peers.set(peerUserId, record);
+
+    // Attach local audio track if microphone stream is already active
+    this.ensureLocalTracks(record);
 
     // Handle local ICE candidates
     pc.onicecandidate = (event) => {
-      if (event.candidate) {
+      if (event.candidate && event.candidate.candidate) {
         const candidatePayload: VoiceIceCandidatePayload = {
           roomId: this.roomId,
           senderUserId: this.currentUserId,
@@ -442,35 +629,49 @@ export class VoiceManager {
 
     // Handle incoming peer audio track
     pc.ontrack = (event) => {
-      if (event.streams && event.streams[0]) {
-        if (!record!.audioElement) {
-          const audio = document.createElement('audio');
-          audio.autoplay = true;
-          audio.srcObject = event.streams[0];
-          record!.audioElement = audio;
-        } else {
-          record!.audioElement.srcObject = event.streams[0];
-        }
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Remote audio track received: id=${event.track.id}, kind=${event.track.kind}, enabled=${event.track.enabled}, readyState=${event.track.readyState}`
+      );
+
+      const stream =
+        event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+
+      if (!record!.audioElement) {
+        const audio = document.createElement('audio');
+        audio.autoplay = true;
+        audio.srcObject = stream;
+        record!.audioElement = audio;
+      } else {
+        record!.audioElement.srcObject = stream;
+      }
+
+      if (typeof record!.audioElement.play === 'function') {
+        record!.audioElement.play().catch((err) => {
+          console.warn(
+            `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] Remote audio play() promise rejected:`,
+            err
+          );
+        });
       }
     };
 
-    // Monitor peer connection state
+    // Monitor peer connection state & log diagnostics
     pc.onconnectionstatechange = () => {
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] connectionState: ${pc.connectionState}, iceConnectionState: ${pc.iceConnectionState}`
+      );
       if (pc.connectionState === 'failed') {
-        // Attempt ICE restart if peer connection failed
-        pc.restartIce();
+        pc.restartIce?.();
       }
       this.emitStatus(null);
     };
 
-    record = {
-      userId: peerUserId,
-      pc,
-      queuedCandidates: [],
-      isRemoteDescriptionSet: false,
+    pc.oniceconnectionstatechange = () => {
+      console.log(
+        `[VoiceManager] [local: ${this.currentUserId}, remote: ${peerUserId}] iceConnectionState: ${pc.iceConnectionState}, connectionState: ${pc.connectionState}`
+      );
     };
 
-    this.peers.set(peerUserId, record);
     this.emitStatus(null);
     return record;
   }
